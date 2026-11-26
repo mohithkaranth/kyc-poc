@@ -9,10 +9,28 @@ from urllib.parse import urlencode
 
 import httpx
 from fastapi import FastAPI, Request
+from opentelemetry import trace
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel
 
 app = FastAPI(title="KYC Workflow POC")
+
+# --- OpenTelemetry: switched on only when OTEL_EXPORTER_OTLP_ENDPOINT is set ---
+if os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT"):
+    from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+    from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+    from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
+    from opentelemetry.sdk.resources import Resource
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import BatchSpanProcessor
+
+    provider = TracerProvider(resource=Resource.create(
+        {"service.name": os.getenv("OTEL_SERVICE_NAME", "kyc-app")}))
+    provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter()))  # sends to the endpoint
+    trace.set_tracer_provider(provider)
+    FastAPIInstrumentor.instrument_app(app)   # a span for every incoming request
+    HTTPXClientInstrumentor().instrument()    # a span for every outgoing call + passes the trace ID on
+tracer = trace.get_tracer("kyc-app")
 POD = socket.gethostname()
 
 # Inside OpenShift, apps reach each other by their service name.
@@ -57,11 +75,15 @@ class Applicant(BaseModel):
 
 def step(name, fn):
     t = time.time()
-    try:
-        out = fn()
-        ok = True
-    except Exception as e:  # keep the workflow going and show the error
-        out, ok = {"error": str(e)}, False
+    with tracer.start_as_current_span(name) as span:  # one span per KYC step
+        try:
+            out = fn()
+            ok = True
+        except Exception as e:  # keep the workflow going and show the error
+            out, ok = {"error": str(e)}, False
+            span.record_exception(e)
+            span.set_status(trace.Status(trace.StatusCode.ERROR))
+        span.set_attribute("kyc.step.ok", ok)
     return {"step": name, "ok": ok, "ms": int((time.time() - t) * 1000), "output": out}
 
 
@@ -85,6 +107,17 @@ def call(url, payload):
     return r.json()
 
 
+def record_llm_usage(resp: dict, system: str):
+    """Add standard GenAI details (model, tokens) to the current trace span."""
+    span = trace.get_current_span()
+    usage = resp.get("usage", {})
+    span.set_attribute("gen_ai.system", system)
+    span.set_attribute("gen_ai.request.model", OPENAI_MODEL)
+    span.set_attribute("gen_ai.response.model", resp.get("model", ""))
+    span.set_attribute("gen_ai.usage.input_tokens", usage.get("prompt_tokens", 0))
+    span.set_attribute("gen_ai.usage.output_tokens", usage.get("completion_tokens", 0))
+
+
 def ai_review(a: Applicant, pep: dict, credit: dict):
     facts = {"applicant": a.model_dump(), "pep_check": pep, "credit_report": credit}
     prompt = (
@@ -104,6 +137,7 @@ def ai_review(a: Applicant, pep: dict, credit: dict):
             timeout=60,
         )
         r.raise_for_status()
+        record_llm_usage(r.json(), "openai via KrakenD")
         text, engine = r.json()["choices"][0]["message"]["content"], f"{OPENAI_MODEL} via KrakenD"
     elif OPENAI_KEY:
         r = httpx.post(
@@ -115,6 +149,7 @@ def ai_review(a: Applicant, pep: dict, credit: dict):
             timeout=60,
         )
         r.raise_for_status()
+        record_llm_usage(r.json(), "openai")
         text, engine = r.json()["choices"][0]["message"]["content"], OPENAI_MODEL
     elif CLAUDE_KEY:
         r = httpx.post(
@@ -220,6 +255,12 @@ def kyc(a: Applicant, request: Request):
     else:
         decision = review.get("recommendation", "MANUAL_REVIEW")
     steps.append({"step": "5. Decision", "ok": True, "ms": 0, "output": {"decision": decision}})
+    span = trace.get_current_span()  # the span for this whole KYC request
+    span.set_attribute("kyc.decision", decision)
+    span.set_attribute("kyc.checked_by", user["username"])
+    span.set_attribute("kyc.pep_match", bool(pep.get("pep_match")))
+    span.set_attribute("kyc.sanctions_match", bool(pep.get("sanctions_match")))
+    span.set_attribute("kyc.credit_grade", str(credit.get("grade")))
     return {"decision": decision, "steps": steps, "pod": POD, "checked_by": user["username"]}
 
 
