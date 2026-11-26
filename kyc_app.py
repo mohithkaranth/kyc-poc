@@ -21,6 +21,8 @@ CREDIT_URL = os.getenv("CREDIT_URL", "http://mock-credit:8080/report")
 # AI provider: OpenAI is used if OPENAI_API_KEY is set, else Claude if ANTHROPIC_API_KEY is set,
 # else simple rules. Keys come from an OpenShift Secret, never from the code.
 OPENAI_KEY = os.getenv("OPENAI_API_KEY", "")
+# If set, AI calls go through the KrakenD gateway, which adds the OpenAI key itself.
+LLM_GATEWAY_URL = os.getenv("LLM_GATEWAY_URL", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
 CLAUDE_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-5")
@@ -93,7 +95,17 @@ def ai_review(a: Applicant, pep: dict, credit: dict):
         "defaults, and whether net worth is plausible for the stated source of income.\n\n"
         + json.dumps(facts)
     )
-    if OPENAI_KEY:
+    if LLM_GATEWAY_URL:
+        r = httpx.post(
+            LLM_GATEWAY_URL,
+            json={"model": OPENAI_MODEL,
+                  "response_format": {"type": "json_object"},
+                  "messages": [{"role": "user", "content": prompt}]},
+            timeout=60,
+        )
+        r.raise_for_status()
+        text, engine = r.json()["choices"][0]["message"]["content"], f"{OPENAI_MODEL} via KrakenD"
+    elif OPENAI_KEY:
         r = httpx.post(
             "https://api.openai.com/v1/chat/completions",
             headers={"Authorization": f"Bearer {OPENAI_KEY}"},
