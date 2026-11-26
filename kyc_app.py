@@ -3,7 +3,6 @@ import json
 import os
 import socket
 import time
-from datetime import date
 
 import httpx
 from fastapi import FastAPI
@@ -27,7 +26,7 @@ CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-5")
 class Applicant(BaseModel):
     name: str
     country: str
-    dob: str  # YYYY-MM-DD
+    age: int
     source_of_income: str
     net_worth_sgd: float
 
@@ -44,14 +43,11 @@ def step(name, fn):
 
 def intake(a: Applicant):
     issues = []
-    try:
-        born = date.fromisoformat(a.dob)
-        age = (date.today() - born).days // 365
-        if age < 18:
-            issues.append("Applicant is under 18")
-    except ValueError:
-        age = None
-        issues.append("Date of birth must be YYYY-MM-DD")
+    age = a.age
+    if age < 18:
+        issues.append("Applicant is under 18")
+    if age > 120:
+        issues.append("Age looks wrong")
     if not a.name.strip() or not a.country.strip():
         issues.append("Name and country are required")
     if a.net_worth_sgd < 0:
@@ -124,7 +120,7 @@ def health():
 
 @app.post("/kyc")
 def kyc(a: Applicant):
-    person = {"name": a.name, "country": a.country, "dob": a.dob}
+    person = {"name": a.name, "country": a.country, "age": a.age}
     steps = [step("1. Intake and validation", lambda: intake(a))]
     if not steps[0]["output"].get("valid"):
         return {"decision": "REJECT_INCOMPLETE", "steps": steps, "pod": POD}
@@ -150,16 +146,16 @@ def home():
 label{display:block;margin-top:10px;font-weight:600}input{width:100%;padding:6px}
 pre{background:#f3f3f3;padding:12px;white-space:pre-wrap}button{margin-top:14px;padding:8px 16px}</style></head>
 <body><h2>KYC Workflow POC</h2>
-<p>Test names: <b>Ahmad Rahman</b> (PEP), <b>Viktor Petrov</b> (sanctioned), <b>Bad Debtor</b> (poor credit), <b>John Tan</b> (clean).</p>
+<p>Try real public figures for PEP screening, <b>Bad Debtor</b> for poor credit, or <b>John Tan</b> as a clean case.</p>
 <label>Full name</label><input id="name" value="John Tan">
 <label>Country</label><input id="country" value="SG">
-<label>Date of birth (YYYY-MM-DD)</label><input id="dob" value="1985-04-12">
+<label>Age</label><input id="age" type="number" value="41">
 <label>Source of income</label><input id="soi" value="Salaried engineer, SGD 8,500 per month">
 <label>Net worth (SGD)</label><input id="nw" value="450000">
 <button onclick="go()">Run KYC</button><h3 id="d"></h3><pre id="o"></pre>
 <script>async function go(){document.getElementById('d').textContent='Running...';
 const v=id=>document.getElementById(id).value;
-const b={name:v('name'),country:v('country'),dob:v('dob'),source_of_income:v('soi'),net_worth_sgd:parseFloat(v('nw'))};
+const b={name:v('name'),country:v('country'),age:parseInt(v('age')),source_of_income:v('soi'),net_worth_sgd:parseFloat(v('nw'))};
 const r=await fetch('/kyc',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});
 const j=await r.json();
 if(!r.ok){document.getElementById('d').textContent='Error '+r.status;document.getElementById('o').textContent=JSON.stringify(j,null,2);return;}

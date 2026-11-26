@@ -20,7 +20,7 @@ FIXED = {
 
 class Person(BaseModel):
     name: str
-    dob: str = ""
+    age: int | None = None
     country: str = ""
 
 
@@ -42,7 +42,7 @@ def report(p: Person):
     if key in FIXED:
         r = dict(FIXED[key])
     else:
-        h = int(hashlib.sha256(f"{key}|{p.dob}".encode()).hexdigest(), 16)
+        h = int(hashlib.sha256(f"{key}|{p.age}".encode()).hexdigest(), 16)
         r = {"score": 1500 + h % 450, "defaults": 1 if h % 10 == 0 else 0,
              "outstanding_sgd": (h % 120) * 1000}
     r.update({"service": "mock-credit", "pod": POD, "grade": grade(r["score"])})
