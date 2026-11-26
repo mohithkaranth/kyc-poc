@@ -158,7 +158,10 @@ pre{background:#f3f3f3;padding:12px;white-space:pre-wrap}button{margin-top:14px;
 <label>Net worth (SGD)</label><input id="nw" value="450000">
 <button onclick="go()">Run KYC</button><h3 id="d"></h3><pre id="o"></pre>
 <script>async function go(){document.getElementById('d').textContent='Running...';
-const b={name:name.value,country:country.value,dob:dob.value,source_of_income:soi.value,net_worth_sgd:parseFloat(nw.value)};
+const v=id=>document.getElementById(id).value;
+const b={name:v('name'),country:v('country'),dob:v('dob'),source_of_income:v('soi'),net_worth_sgd:parseFloat(v('nw'))};
 const r=await fetch('/kyc',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});
-const j=await r.json();document.getElementById('d').textContent='Decision: '+j.decision;
+const j=await r.json();
+if(!r.ok){document.getElementById('d').textContent='Error '+r.status;document.getElementById('o').textContent=JSON.stringify(j,null,2);return;}
+document.getElementById('d').textContent='Decision: '+j.decision;
 document.getElementById('o').textContent=JSON.stringify(j.steps,null,2);}</script></body></html>"""
