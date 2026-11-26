@@ -1,12 +1,15 @@
 """KYC workflow: intake -> PEP/sanctions -> credit bureau -> AI risk review -> decision."""
+import base64
 import json
 import os
+import secrets
 import socket
 import time
+from urllib.parse import urlencode
 
 import httpx
-from fastapi import FastAPI
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, Request
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel
 
 app = FastAPI(title="KYC Workflow POC")
@@ -21,6 +24,25 @@ OPENAI_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
 CLAUDE_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-5")
+
+# Keycloak login. Login is switched on only when KEYCLOAK_URL is set.
+KC_URL = os.getenv("KEYCLOAK_URL", "").rstrip("/")            # public address (browser)
+KC_INTERNAL = os.getenv("KEYCLOAK_INTERNAL_URL", KC_URL).rstrip("/")  # in-cluster address (app)
+KC_REALM = os.getenv("KEYCLOAK_REALM", "kyc")
+KC_CLIENT = os.getenv("KEYCLOAK_CLIENT_ID", "kyc-app")
+KC_SECRET = os.getenv("KEYCLOAK_CLIENT_SECRET", "")
+APP_URL = os.getenv("APP_URL", "").rstrip("/")                # this app's public address
+SESSIONS = {}  # session id -> logged-in user (kept in memory, fine for a POC)
+
+
+def oidc(base: str, path: str) -> str:
+    return f"{base}/realms/{KC_REALM}/protocol/openid-connect/{path}"
+
+
+def current_user(request: Request):
+    if not KC_URL:
+        return {"username": "anonymous (login not configured)"}
+    return SESSIONS.get(request.cookies.get("kyc_session", ""))
 
 
 class Applicant(BaseModel):
@@ -118,12 +140,62 @@ def health():
     return {"status": "ok", "pod": POD}
 
 
+@app.get("/login")
+def login():
+    # Step 1: send the browser to Keycloak's login page.
+    state = secrets.token_urlsafe(16)
+    params = {"client_id": KC_CLIENT, "response_type": "code", "scope": "openid",
+              "redirect_uri": f"{APP_URL}/callback", "state": state}
+    resp = RedirectResponse(oidc(KC_URL, "auth") + "?" + urlencode(params))
+    resp.set_cookie("kyc_state", state, httponly=True, secure=True, samesite="lax")
+    return resp
+
+
+@app.get("/callback")
+def callback(request: Request, code: str = "", state: str = ""):
+    # Step 2: Keycloak sends the browser back with a one-time code.
+    if not code or state != request.cookies.get("kyc_state"):
+        return HTMLResponse("Login failed: invalid state. <a href='/login'>Try again</a>", 400)
+    # Step 3: the app swaps the code for tokens, server to server.
+    r = httpx.post(oidc(KC_INTERNAL, "token"), data={
+        "grant_type": "authorization_code", "code": code,
+        "redirect_uri": f"{APP_URL}/callback",
+        "client_id": KC_CLIENT, "client_secret": KC_SECRET}, timeout=10)
+    if r.status_code != 200:
+        return HTMLResponse(f"Token exchange failed: {r.text}", 400)
+    tokens = r.json()
+    # Read who logged in from the ID token (received directly from Keycloak over HTTPS).
+    payload = tokens["id_token"].split(".")[1]
+    claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+    sid = secrets.token_urlsafe(24)
+    SESSIONS[sid] = {"username": claims.get("preferred_username"),
+                     "name": claims.get("name"), "id_token": tokens["id_token"]}
+    resp = RedirectResponse("/")
+    resp.set_cookie("kyc_session", sid, httponly=True, secure=True, samesite="lax")
+    resp.delete_cookie("kyc_state")
+    return resp
+
+
+@app.get("/logout")
+def logout(request: Request):
+    user = SESSIONS.pop(request.cookies.get("kyc_session", ""), None)
+    params = {"client_id": KC_CLIENT, "post_logout_redirect_uri": f"{APP_URL}/"}
+    if user:
+        params["id_token_hint"] = user["id_token"]
+    resp = RedirectResponse(oidc(KC_URL, "logout") + "?" + urlencode(params))
+    resp.delete_cookie("kyc_session")
+    return resp
+
+
 @app.post("/kyc")
-def kyc(a: Applicant):
+def kyc(a: Applicant, request: Request):
+    user = current_user(request)
+    if not user:
+        return JSONResponse({"detail": "Not logged in"}, 401)
     person = {"name": a.name, "country": a.country, "age": a.age}
     steps = [step("1. Intake and validation", lambda: intake(a))]
     if not steps[0]["output"].get("valid"):
-        return {"decision": "REJECT_INCOMPLETE", "steps": steps, "pod": POD}
+        return {"decision": "REJECT_INCOMPLETE", "steps": steps, "pod": POD, "checked_by": user["username"]}
     steps.append(step("2. PEP and sanctions check", lambda: call(PEP_URL, person)))
     steps.append(step("3. Credit bureau check", lambda: call(CREDIT_URL, person)))
     pep, credit = steps[1]["output"], steps[2]["output"]
@@ -136,16 +208,20 @@ def kyc(a: Applicant):
     else:
         decision = review.get("recommendation", "MANUAL_REVIEW")
     steps.append({"step": "5. Decision", "ok": True, "ms": 0, "output": {"decision": decision}})
-    return {"decision": decision, "steps": steps, "pod": POD}
+    return {"decision": decision, "steps": steps, "pod": POD, "checked_by": user["username"]}
 
 
 @app.get("/", response_class=HTMLResponse)
-def home():
+def home(request: Request):
+    user = current_user(request)
+    if not user:
+        return RedirectResponse("/login")
+    who = f"Logged in as <b>{user['username']}</b>" + (" &middot; <a href='/logout'>Log out</a>" if KC_URL else "")
     return """<!doctype html><html><head><meta charset="utf-8"><title>KYC Workflow POC</title>
 <style>body{font-family:sans-serif;max-width:760px;margin:32px auto;padding:0 16px}
 label{display:block;margin-top:10px;font-weight:600}input{width:100%;padding:6px}
 pre{background:#f3f3f3;padding:12px;white-space:pre-wrap}button{margin-top:14px;padding:8px 16px}</style></head>
-<body><h2>KYC Workflow POC</h2>
+<body><p style="text-align:right">""" + who + """</p><h2>KYC Workflow POC</h2>
 <p>Try real public figures for PEP screening, <b>Bad Debtor</b> for poor credit, or <b>John Tan</b> as a clean case.</p>
 <label>Full name</label><input id="name" value="John Tan">
 <label>Country</label><input id="country" value="SG">
@@ -159,5 +235,5 @@ const b={name:v('name'),country:v('country'),age:parseInt(v('age')),source_of_in
 const r=await fetch('/kyc',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});
 const j=await r.json();
 if(!r.ok){document.getElementById('d').textContent='Error '+r.status;document.getElementById('o').textContent=JSON.stringify(j,null,2);return;}
-document.getElementById('d').textContent='Decision: '+j.decision;
+document.getElementById('d').textContent='Decision: '+j.decision+'  (checked by '+j.checked_by+')';
 document.getElementById('o').textContent=JSON.stringify(j.steps,null,2);}</script></body></html>"""
